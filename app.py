@@ -1,41 +1,45 @@
 """
-Expense Analyzer
-----------------
-Reads a Cash Book (PDF or Excel) and prints a total spent per category.
+Expense Analyzer - Web App
+---------------------------
+Upload a Cash Book (PDF or Excel) in the browser and see a total spent
+per category. This is a Streamlit port of the original CLI script so it
+can be deployed and used from a phone or any browser.
 
-FIX (2026-07-19): The PDF path previously returned wrong / ungrouped totals
-because the source PDF renders its category text ("ICICI Credit Card",
-"SBI Card", "PazCare", etc.) in a decorative font that was flattened to
-vector outlines instead of embedded as real text. pdfplumber therefore read
-those cells as blank, and the script's fallback labeled each row
-"Entry <n>" -- so the same category (e.g. two ICICI Credit Card charges)
-was never grouped together.
-
-The fix below tries normal text extraction first (fast + exact), and only
-falls back to OCR (rendering that specific cell as an image and reading it
-visually) when a cell truly has no embedded text. This keeps things fast for
-normal PDFs and correctly recovers category names from decorative-font ones.
-
-Extra dependencies vs. the original script:
-    pip install pytesseract --break-system-packages
-    (the tesseract-ocr binary must also be installed on the system, e.g.
-     `sudo apt install tesseract-ocr` on Ubuntu/Debian)
+Core extraction logic (PDF text/OCR extraction, Excel parsing, column
+detection) is unchanged from the original script. What changed:
+  - input()/file-path based I/O -> st.file_uploader (works with in-memory
+    uploaded files, no need to save to disk first)
+  - print() output -> st.dataframe / st.metric / st.bar_chart
+  - the tesseract_cmd path is now auto-detected (works on Linux servers,
+    where Streamlit Community Cloud runs) instead of being hardcoded to
+    the Windows Tesseract install path
 """
 
 import os
 import re
+import shutil
+
 import pandas as pd
 import pdfplumber
 import pytesseract
 from PIL import ImageOps
+import streamlit as st
 
-# Point pytesseract to the Tesseract executable
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# --- Point pytesseract to the Tesseract executable --------------------------
+# On Streamlit Community Cloud (Linux) tesseract is installed via
+# packages.txt and available on PATH. Fall back to the Windows default
+# path only if nothing is found on PATH and we're actually on Windows,
+# so this still works if you run the script locally on your own PC.
+_tess_path = shutil.which("tesseract")
+if _tess_path:
+    pytesseract.pytesseract.tesseract_cmd = _tess_path
+elif os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# --- OCR settings -----------------------------------------------------------
-OCR_DPI = 600          # higher DPI = much better OCR accuracy on small cells
-OCR_PAD_PX = 5         # small padding so glyphs aren't clipped at cell edges
-OCR_CONFIG = "--psm 13"  # treat each cropped cell as one raw line of text
+# --- OCR settings -------------------------------------------------------
+OCR_DPI = 600
+OCR_PAD_PX = 5
+OCR_CONFIG = "--psm 13"
 
 
 def parse_amount(value):
@@ -54,19 +58,13 @@ def normalize_cell(value):
     if value is None:
         return ""
     text = re.sub(r"\s+", " ", str(value).replace("\n", " ")).strip()
-    # strip stray OCR noise characters (|, —, -, etc.) from the ends only
     text = re.sub(r'^[\|\-\u2014_~"\']+\s*', "", text)
     text = re.sub(r'\s*[\|\-\u2014_~"\']+$', "", text)
     return text.strip()
 
 
 def extract_text_by_position(page, bbox):
-    """Extract real embedded text whose character centers fall inside bbox.
-
-    More reliable than pdfplumber's crop()/within_bbox(), which can either
-    bleed in text from neighboring rows or drop characters that slightly
-    overhang a cell's border.
-    """
+    """Extract real embedded text whose character centers fall inside bbox."""
     x0, top, x1, bottom = bbox
     chars = [
         c for c in page.chars
@@ -88,11 +86,7 @@ def extract_text_by_position(page, bbox):
 
 
 def ocr_cell(page_image, bbox, scale):
-    """Rasterize just this cell and read it visually with Tesseract.
-
-    Used only when a cell has no real embedded text (e.g. a decorative
-    font that was flattened into vector artwork rather than real glyphs).
-    """
+    """Rasterize just this cell and read it visually with Tesseract."""
     left, top, right, bottom = [coord * scale for coord in bbox]
     crop = page_image.original.crop(
         (left - OCR_PAD_PX, top - OCR_PAD_PX, right + OCR_PAD_PX, bottom + OCR_PAD_PX)
@@ -112,7 +106,7 @@ def get_cell_text(page, page_image, bbox, scale):
 
 
 def detect_columns(header_texts):
-    note_idx, cash_out_idx = 2, 4  # sensible defaults if headers can't be read
+    note_idx, cash_out_idx = 2, 4
 
     note_keywords = ["note", "particular", "description", "detail", "remark", "category"]
     out_keywords = ["cash out", "out", "payment", "withdrawal"]
@@ -127,22 +121,22 @@ def detect_columns(header_texts):
     return note_idx, cash_out_idx
 
 
-def extract_data_from_pdf(pdf_path):
+def extract_data_from_pdf(pdf_file):
+    """pdf_file: a path OR a file-like object (e.g. an uploaded file)."""
     data = []
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             tables = page.find_tables()
             if not tables:
                 continue
 
-            # Render the page once per page (not once per cell) for speed.
             page_image = page.to_image(resolution=OCR_DPI)
             scale = OCR_DPI / 72
 
             for table in tables:
                 rows = table.rows
                 if len(rows) < 2:
-                    continue  # need at least a header + one data row
+                    continue
 
                 header_texts = [
                     get_cell_text(page, page_image, cell, scale)
@@ -151,7 +145,7 @@ def extract_data_from_pdf(pdf_path):
                 note_idx, cash_out_idx = detect_columns(header_texts)
                 max_idx = max(note_idx, cash_out_idx)
                 if max_idx >= len(rows[0].cells):
-                    continue  # this table doesn't have the columns we need
+                    continue
 
                 for row in rows[1:]:
                     cells = row.cells
@@ -170,8 +164,9 @@ def extract_data_from_pdf(pdf_path):
     return pd.DataFrame(data)
 
 
-def extract_data_from_excel(excel_path):
-    df = pd.read_excel(excel_path)
+def extract_data_from_excel(excel_file):
+    """excel_file: a path OR a file-like object (e.g. an uploaded file)."""
+    df = pd.read_excel(excel_file)
     df.columns = [str(col).strip().lower() for col in df.columns]
 
     note_col = next((col for col in df.columns if "note" in col), None)
@@ -189,58 +184,49 @@ def extract_data_from_excel(excel_path):
     return pd.DataFrame({"Category": df[note_col].astype(str).str.strip(), "Amount": df["Amount"]})
 
 
-def process_file():
-    print("-" * 50)
-    file_path = input("Enter the name of your file (e.g., Cash Book 19-Jul-2026.pdf): ").strip()
+# ----------------------------------------------------------------------------
+# Streamlit UI
+# ----------------------------------------------------------------------------
+st.set_page_config(page_title="Expense Analyzer", page_icon="💰", layout="centered")
 
-    file_path = file_path.strip("\"'")
+st.title("💰 Expense Analyzer")
+st.write(
+    "Upload your Cash Book (PDF or Excel) and get a total spent per category. "
+    "Works the same on your phone as on desktop."
+)
 
-    if not os.path.exists(file_path):
-        for ext in (".pdf", ".xlsx", ".xls"):
-            candidate = file_path if file_path.lower().endswith(ext) else file_path + ext
-            if os.path.exists(candidate):
-                file_path = candidate
-                break
+uploaded_file = st.file_uploader("Choose a file", type=["pdf", "xlsx", "xls"])
 
-    if not os.path.exists(file_path):
-        print(f"\nError: Could not find '{file_path}'. Make sure it is in the same folder as this script.")
-        return
+if uploaded_file is not None:
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
 
-    try:
-        ext = os.path.splitext(file_path)[1].lower()
+    with st.spinner("Reading and analyzing your file... (PDFs with OCR can take a minute)"):
+        try:
+            if ext == ".pdf":
+                df = extract_data_from_pdf(uploaded_file)
+            elif ext in (".xlsx", ".xls"):
+                df = extract_data_from_excel(uploaded_file)
+            else:
+                st.error("Unsupported file format. Please upload a PDF or Excel file.")
+                df = pd.DataFrame()
+        except Exception as e:
+            st.error(f"An error occurred while processing the file: {e}")
+            df = pd.DataFrame()
 
-        if ext == ".pdf":
-            df = extract_data_from_pdf(file_path)
-        elif ext in [".xlsx", ".xls"]:
-            df = extract_data_from_excel(file_path)
-        else:
-            print("\nError: Unsupported file format. Please use PDF or Excel.")
-            return
-
-        if df.empty:
-            print("\nNo transaction data found in the file.")
-            return
-
+    if not df.empty:
         summary = df.groupby("Category")["Amount"].sum().reset_index()
-        total_spent = summary["Amount"].sum()
         summary = summary.sort_values(by="Amount", ascending=False)
+        total_spent = summary["Amount"].sum()
 
-        print("\n" + "=" * 40)
-        print("          EXPENSE BREAKDOWN          ")
-        print("=" * 40)
-        print(f"{'Category / Note':<25} | {'Amount Spent':<10}")
-        print("-" * 40)
-
-        for _, row in summary.iterrows():
-            print(f"{row['Category']:<25} | {row['Amount']:<10.2f}")
-
-        print("-" * 40)
-        print(f"{'TOTAL':<25} | {total_spent:<10.2f}")
-        print("=" * 40)
-
-    except Exception as e:
-        print(f"\nAn error occurred: {str(e)}")
-
-
-if __name__ == "__main__":
-    process_file()
+        st.subheader("Expense Breakdown")
+        st.dataframe(
+            summary.rename(columns={"Category": "Category / Note", "Amount": "Amount Spent"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.metric("Total Spent", f"{total_spent:,.2f}")
+        st.bar_chart(summary.set_index("Category")["Amount"])
+    else:
+        st.warning("No transaction data found in the file.")
+else:
+    st.info("👆 Upload a Cash Book file to get started.")
