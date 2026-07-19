@@ -13,6 +13,9 @@ detection) is unchanged from the original script. What changed:
   - the tesseract_cmd path is now auto-detected (works on Linux servers,
     where Streamlit Community Cloud runs) instead of being hardcoded to
     the Windows Tesseract install path
+  - OCR post-processing now fixes known character-confusion misreads
+    (e.g. "UPI" being read as "UPL") since psm 13 skips Tesseract's
+    normal dictionary correction
 """
 
 import os
@@ -38,8 +41,32 @@ elif os.name == "nt":
 
 # --- OCR settings -------------------------------------------------------
 OCR_DPI = 600
-OCR_PAD_PX = 5
+OCR_PAD_PX = 8
 OCR_CONFIG = "--psm 13"
+
+# --- Known OCR character-confusion fixes --------------------------------
+# psm 13 deliberately skips Tesseract's dictionary/language-model
+# correction (raw line mode), so ambiguous glyphs like a capital I vs L
+# never get auto-corrected. That's desirable for arbitrary note text
+# (we don't want "corrections" turning merchant names into English
+# words), but it reliably mangles known domain terms. We fix those
+# explicitly here instead of enabling Tesseract's generic English
+# dictionary, which doesn't know "UPI" is a word anyway and could
+# introduce new mistakes elsewhere.
+#
+# Add more patterns here as you spot other recurring misreads.
+_OCR_CONFUSIONS = [
+    (r"\bUPL\b", "UPI"),
+    (r"\bUPl\b", "UPI"),
+    (r"\bUP1\b", "UPI"),
+]
+
+
+def fix_ocr_confusions(text):
+    """Apply known OCR character-confusion corrections to visually-OCR'd text."""
+    for pattern, replacement in _OCR_CONFUSIONS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
 
 
 def parse_amount(value):
@@ -92,8 +119,11 @@ def ocr_cell(page_image, bbox, scale):
         (left - OCR_PAD_PX, top - OCR_PAD_PX, right + OCR_PAD_PX, bottom + OCR_PAD_PX)
     ).convert("L")
     crop = ImageOps.autocontrast(crop)
+    # Binarize to sharpen thin-stroke distinctions (e.g. I vs L) that get
+    # blurred by anti-aliasing/greyscale at small crop sizes.
+    crop = crop.point(lambda p: 255 if p > 160 else 0)
     text = pytesseract.image_to_string(crop, config=OCR_CONFIG)
-    return normalize_cell(text)
+    return fix_ocr_confusions(normalize_cell(text))
 
 
 def get_cell_text(page, page_image, bbox, scale):
