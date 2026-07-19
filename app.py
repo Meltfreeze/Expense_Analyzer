@@ -197,7 +197,11 @@ st.write(
 
 uploaded_file = st.file_uploader("Choose a file", type=["pdf", "xlsx", "xls"])
 
-if uploaded_file is not None:
+# Processing only runs when the user clicks "Analyze", not automatically on upload.
+# The button is disabled until a file is actually selected.
+analyze = st.button("Analyze", type="primary", disabled=uploaded_file is None)
+
+if analyze and uploaded_file is not None:
     ext = os.path.splitext(uploaded_file.name)[1].lower()
 
     with st.spinner("Reading and analyzing your file... (PDFs with OCR can take a minute)"):
@@ -213,6 +217,13 @@ if uploaded_file is not None:
             st.error(f"An error occurred while processing the file: {e}")
             df = pd.DataFrame()
 
+    # Store the result so it stays on screen across Streamlit reruns
+    # (e.g. if the user sorts the table) instead of disappearing.
+    st.session_state["result"] = df
+
+# Show whatever result we last computed (if any).
+if "result" in st.session_state:
+    df = st.session_state["result"]
     if not df.empty:
         summary = df.groupby("Category")["Amount"].sum().reset_index()
         summary = summary.sort_values(by="Amount", ascending=False)
@@ -228,5 +239,7 @@ if uploaded_file is not None:
         st.bar_chart(summary.set_index("Category")["Amount"])
     else:
         st.warning("No transaction data found in the file.")
+elif uploaded_file is None:
+    st.info("👆 Upload a Cash Book file, then click **Analyze**.")
 else:
-    st.info("👆 Upload a Cash Book file to get started.")
+    st.info("✅ File ready. Click **Analyze** to process it.")
